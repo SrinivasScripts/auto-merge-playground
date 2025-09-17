@@ -18,76 +18,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      # (Optional) Ensure a modern gh; avoids old-CLI quirks like missing --json
-      - name: Install latest GitHub CLI
-        run: |
-          set -euo pipefail
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
-            sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
-            sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y gh jq
-          gh --version
-
       - name: Derive branch name
         id: ctx
         run: echo "branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Create or reuse PR → main (author = github-actions[bot])
+      - name: Create or reuse PR → main
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           branch="${{ steps.ctx.outputs.branch }}"
-
-          # Try to find an existing open PR first
-          existing=$(gh pr list --head "$branch" --base main --state open --json number,url -q '.[0]' || true)
-          if [[ -n "$existing" ]]; then
-            pr_number=$(echo "$existing" | jq -r .number)
-            pr_url=$(echo "$existing" | jq -r .url)
-            echo "Reusing PR #$pr_number ($pr_url)"
-          else
-            pr_json=$(gh pr create \
-              --title "[AUTO] PR from $branch to main" \
-              --body  "Auto-generated from \`$branch\` to \`main\`." \
-              --base main --head "$branch" \
-              --json number,url)
-            pr_number=$(echo "$pr_json" | jq -r .number)
-            pr_url=$(echo "$pr_json" | jq -r .url)
-            echo "Created PR #$pr_number ($pr_url)"
+          pr_url=$(gh pr create --title "[AUTO] PR from $branch to main" \
+            --body "Auto-generated from \`$branch\` to \`main\`." \
+            --base main --head "$branch" 2>/dev/null || true)
+          if [[ -z "$pr_url" ]]; then
+            pr_url=$(gh pr list --head "$branch" --base main --state open -q '.[]|.url')
           fi
+          echo "number=$(basename $pr_url)" >> "$GITHUB_OUTPUT"
 
-          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
-          echo "url=$pr_url" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure BOT_PAT exists (fail fast if missing)
-        env:
-          BOT_PAT: ${{ secrets.BOT_PAT }}
-        run: |
-          if [ -z "$BOT_PAT" ]; then
-            echo "::error::Missing BOT_PAT. Create a fine-grained PAT scoped to THIS repo with:
-  - Contents: Read & write
-  - Pull requests: Read & write
-Then add it as Actions secret BOT_PAT."
-            exit 1
-          fi
-
-      - name: Approve PR (bot review; must be a DIFFERENT user than PR author)
+      - name: Approve PR
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          set -euo pipefail
-          echo "Approving PR #${{ steps.pr.outputs.number }} as $(gh api user --jq .login)…"
-          gh pr review ${{ steps.pr.outputs.number }} --approve
+        run: gh pr review ${{ steps.pr.outputs.number }} --approve
 
-      - name: Enable Auto-merge (merges immediately if requirements met)
+      - name: Enable Auto-merge
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          set -euo pipefail
-          # If your repo enforces linear history, switch to --squash or --rebase
-          gh pr merge ${{ steps.pr.outputs.number }} --auto --merge --delete-branch
-          echo "Auto-merge enabled for PR #${{ steps.pr.outputs.number }}"
+        run: gh pr merge ${{ steps.pr.outputs.number }} --auto --merge --delete-branch
