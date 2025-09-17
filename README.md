@@ -1,8 +1,1 @@
-# auto-merge-playground .. test1
-tes
-test
-testimg
-khhh
-jkkj
-cff
-bfvbj
+# auto-merge-playground
