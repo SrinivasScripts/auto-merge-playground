@@ -1,93 +1,62 @@
-name: Pull-Request Auto-Deploy
+name: Auto-approve & Auto-merge auto-* PRs
 
 on:
-  push:
-    branches:
-      - "auto-*"
+  pull_request:
+    branches: [ main ]                     # Target branch for the PR
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: write
   pull-requests: write
-
-env:
-  MERGE_METHOD: merge   # or: squash | rebase
+  checks: read
 
 jobs:
-  auto-pr-merge:
+  auto_merge:
+    if: startsWith(github.head_ref, 'auto-') && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      # Built-in GitHub CLI on ubuntu-latest is recent enough; no upgrade needed
+      - name: Verify GitHub CLI
+        run: gh --version
 
-      # Ensure modern gh so --json/--auto works
-      - name: Install latest GitHub CLI
-        run: |
-          set -euo pipefail
-          sudo apt-get remove -y gh || true
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
-            sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
-            sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y gh jq
-          gh --version
-
-      - name: Derive branch name
+      - name: Capture PR context
         id: ctx
-        run: echo "branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-
-      # Create or reuse PR (author = github-actions[bot])
-      - name: Create or reuse PR → main
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          branch="${{ steps.ctx.outputs.branch }}"
-          existing=$(gh pr list --head "$branch" --base main --state open --json number,url,author --jq '.[0]' || true)
-          if [[ -n "$existing" ]]; then
-            echo "$existing" | jq .
-            echo "number=$(echo "$existing" | jq -r .number)" >> "$GITHUB_OUTPUT"
-          else
-            created=$(gh pr create \
-              --title "[AUTO] PR from $branch to main" \
-              --body  "Auto-generated from \`$branch\` to \`main\`." \
-              --base main --head "$branch" \
-              --json number,url,author)
-            echo "$created" | jq .
-            echo "number=$(echo "$created" | jq -r .number)" >> "$GITHUB_OUTPUT"
-          fi
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "AUTHOR=${{ github.event.pull_request.user.login }}" >> "$GITHUB_OUTPUT"
+          echo "HEAD_REF=${{ github.head_ref }}" >> "$GITHUB_OUTPUT"
+          echo "BASE_REF=${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
 
-      # Guard: approver must differ from author
+      # Ensure approver identity differs from PR author
       - name: Guard identities (approver ≠ author)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BOT_PAT: ${{ secrets.BOT_PAT }}
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
           set -euo pipefail
-          pr=${{ steps.pr.outputs.number }}
-          author=$(gh api repos/${{ github.repository }}/pulls/$pr --jq .user.login)
-          approver=$(GH_TOKEN=$BOT_PAT gh api user --jq .login)
-          echo "PR author : $author"
-          echo "Approver  : $approver"
-          if [ "$author" = "$approver" ]; then
-            echo "::error::Approver and author are the same ($author). Use a different account/token for BOT_PAT."
+          APPROVER=$(gh api user --jq .login)
+          echo "PR author : ${{ steps.ctx.outputs.AUTHOR }}"
+          echo "Approver  : $APPROVER"
+          if [ "$APPROVER" = "${{ steps.ctx.outputs.AUTHOR }}" ]; then
+            echo "::error::Approver and author are the same. Use a different account for BOT_PAT."
             exit 1
           fi
 
-      # Approve to satisfy review requirement
       - name: Approve PR
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr review ${{ steps.pr.outputs.number }} --approve
+        run: |
+          set -euo pipefail
+          gh pr review ${{ steps.ctx.outputs.PR_NUMBER }} --approve
+          echo "✅ Approved PR #${{ steps.ctx.outputs.PR_NUMBER }}"
 
-      # Enable auto-merge -> GitHub will MERGE ONLY AFTER required checks pass
-      - name: Enable Auto-merge (waits for checks)
+      - name: Enable Auto-merge (delete branch after merge)
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr merge ${{ steps.pr.outputs.number }} --auto --${{ env.MERGE_METHOD }} --delete-branch
+        run: |
+          set -euo pipefail
+          gh pr merge ${{ steps.ctx.outputs.PR_NUMBER }} --auto --merge --delete-branch
+          echo "✅ Auto-merge enabled for PR #${{ steps.ctx.outputs.PR_NUMBER }}"
 
       - name: Done
-        run: echo "✅ PR is set to auto-merge once checks are green."
+        run: echo "Workflow finished successfully."
