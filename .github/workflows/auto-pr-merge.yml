@@ -5,24 +5,21 @@ on:
     branches:
       - 'auto-*'
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 
+          fetch-depth: 0
+
       - name: Set Branch Name
         run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
-      - name: Print Current Branch
-        run: "echo Current branch name: $BRANCH_NAME"
-      - name: Configure Git
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions@github.com"
-      - name: Fetch target branch (main)
-        run: git fetch origin main:main
+
       - name: Create Pull Request via GitHub API
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -31,12 +28,12 @@ jobs:
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/pulls \
-            -d '{
-              "title": "[AUTO] PR from '${BRANCH_NAME}' to main",
-              "head": "'${BRANCH_NAME}'",
-              "base": "main",
-              "body": "This PR is auto-generated from '${BRANCH_NAME}' to main."
-            }')
+            -d "{
+              \"title\": \"[AUTO] PR from $BRANCH_NAME to main\",
+              \"head\": \"$BRANCH_NAME\",
+              \"base\": \"main\",
+              \"body\": \"This PR is auto-generated from $BRANCH_NAME to main.\"
+            }")
           echo "$PR_RESPONSE"
           PR_NUMBER=$(echo "$PR_RESPONSE" | jq .number)
           if [ "$PR_NUMBER" == "null" ]; then
@@ -46,15 +43,3 @@ jobs:
             echo "PR created successfully: #$PR_NUMBER"
             echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
           fi
-      - name: Auto-Merge Pull Request
-        env:
-          GITHUB_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          curl -s -X PUT \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/merge \
-            -d '{
-              "commit_title": "Auto-merged PR",
-              "merge_method": "merge"
-            }'
