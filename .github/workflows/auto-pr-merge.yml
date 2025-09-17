@@ -13,25 +13,31 @@ jobs:
   auto-pr-merge:
     runs-on: ubuntu-latest
     steps:
-      # ---------- Setup ----------
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install GitHub CLI
+      # ---------- Upgrade GitHub CLI ----------
+      - name: Install latest GitHub CLI
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y gh jq
-          gh --version
+          sudo apt-get remove -y gh || true
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+            sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+          https://cli.github.com/packages stable main" | \
+          sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install -y gh jq
+          gh version
 
       - name: Derive branch name
         id: ctx
         run: echo "branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-      # ---------- Create (or recreate) PR as github-actions[bot] ----------
-      - name: Create or reuse PR → main (author = github-actions[bot])
+      - name: Create or reuse PR → main
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,7 +45,7 @@ jobs:
           set -euo pipefail
           branch="${{ steps.ctx.outputs.branch }}"
 
-          # Find existing open PR from this branch to main
+          # Look for existing PR
           existing=$(gh pr list --head "$branch" --base main --state open --json number,author,url --jq '.[0]' || true)
 
           if [[ -n "$existing" ]]; then
@@ -47,11 +53,9 @@ jobs:
             pr_url=$(echo "$existing" | jq -r .url)
             pr_author=$(echo "$existing" | jq -r .author.login)
             echo "Found existing PR #$pr_number by $pr_author ($pr_url)"
-
-            # If not authored by github-actions[bot], close so we can recreate with this token
             if [[ "$pr_author" != "github-actions[bot]" ]]; then
-              echo "Closing PR #$pr_number (author=$pr_author) to recreate as github-actions[bot]…"
-              gh pr close "$pr_number" -c "Recreating PR authored by github-actions[bot] for auto-approval."
+              echo "Closing PR #$pr_number to recreate as github-actions[bot]…"
+              gh pr close "$pr_number" -c "Recreating as github-actions[bot] for auto-approval"
               existing=""
             fi
           fi
@@ -70,7 +74,6 @@ jobs:
 
           echo "number=$pr_number" >> "$GITHUB_OUTPUT"
 
-      # ---------- Guard: approver must differ from author ----------
       - name: Guard identities (approver ≠ author)
         env:
           BOT_PAT: ${{ secrets.BOT_PAT }}
@@ -87,8 +90,7 @@ jobs:
             exit 1
           fi
 
-      # ---------- Approve & Auto-merge ----------
-      - name: Approve PR (bot review)
+      - name: Approve PR
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: gh pr review ${{ steps.pr.outputs.number }} --approve
@@ -98,6 +100,5 @@ jobs:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
           set -euo pipefail
-          # Use --squash or --rebase if your repo enforces linear history
           gh pr merge ${{ steps.pr.outputs.number }} --auto --merge --delete-branch
           echo "Auto-merge enabled for PR #${{ steps.pr.outputs.number }}"
