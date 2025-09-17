@@ -1,45 +1,52 @@
-name: Auto PR + Approve + Auto-merge (simple)
+name: Pull-Request Auto-Deploy
 
 on:
   push:
-    branches: [ "auto-*" ]
+    branches:
+      - "auto-*"
 
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
-  auto_pr_and_merge:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set branch name
         run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
 
-      - name: Create or reuse PR (skip if none)
-        id: create
+      # Create or reuse a PR
+      - name: Create or reuse PR
+        id: create_pr
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           API="https://api.github.com/repos/${{ github.repository }}"
-          CREATE=$(curl -s -w "\n%{http_code}\n" -X POST \
+          # Try creating the PR
+          RESP=$(curl -s -w "\n%{http_code}\n" -X POST \
             -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
             "$API/pulls" \
-            -d "{\"title\":\"[AUTO] $BRANCH_NAME → main\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Auto-generated from '$BRANCH_NAME' to main.\"}")
-          BODY=$(echo "$CREATE" | sed '$d'); CODE=$(echo "$CREATE" | tail -n1)
+            -d "{\"title\":\"[AUTO] ${BRANCH_NAME} → main\",\"head\":\"${BRANCH_NAME}\",\"base\":\"main\",\"body\":\"Auto-generated from '${BRANCH_NAME}' to main.\"}")
+          BODY=$(echo "$RESP" | sed '$d'); CODE=$(echo "$RESP" | tail -n1)
 
           if [ "$CODE" = "201" ]; then
-            echo "pr=$(echo "$BODY" | jq -r .number)" >> "$GITHUB_OUTPUT"
+            PR_NUMBER=$(echo "$BODY" | jq -r .number)
+            echo "pr=$PR_NUMBER" >> "$GITHUB_OUTPUT"
             echo "has_pr=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Created PR"
+            echo "✅ Created PR #$PR_NUMBER"
             exit 0
           fi
 
+          # Reuse existing open PR if it already exists
           PR_NUMBER=$(curl -s -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
-            "$API/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
+            "$API/pulls?state=open&head=${{ github.repository_owner }}:${BRANCH_NAME}&base=main" \
             | jq -r '.[0].number')
 
           if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
@@ -49,29 +56,12 @@ jobs:
             exit 0
           fi
 
-          STATUS=$(curl -s -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
-            "$API/compare/main...$BRANCH_NAME" | jq -r .status)
-          if [ "$STATUS" = "identical" ] || [ "$STATUS" = "behind" ]; then
-            echo "ℹ️ No new commits ahead of main; skipping PR."
-            echo "has_pr=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "::warning::PR creation failed (HTTP $CODE), skipping."
+          echo "ℹ️ No new PR needed."
           echo "has_pr=false" >> "$GITHUB_OUTPUT"
-          exit 0
 
-      - name: Approve PR
-        if: steps.create.outputs.has_pr == 'true'
+      # Auto-merge only if a PR exists
+      - name: Auto-merge PR
+        if: steps.create_pr.outputs.has_pr == 'true'
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr review ${{ steps.create.outputs.pr }} --repo "${{ github.repository }}" --approve
-
-      - name: Enable Auto-merge
-        if: steps.create.outputs.has_pr == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr merge ${{ steps.create.outputs.pr }} --repo "${{ github.repository }}" --auto --squash --delete-branch
-
-      - name: Done
-        run: echo "🎉 Workflow finished successfully."
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge ${{ steps.create_pr.outputs.pr }} --repo "${{ github.repository }}" --auto --merge --delete-branch
