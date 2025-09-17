@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   auto_pr_and_merge:
+    if: startsWith(github.ref_name, 'auto-') 
     runs-on: ubuntu-latest
     steps:
       - name: Install jq
