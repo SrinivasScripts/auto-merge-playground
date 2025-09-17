@@ -44,21 +44,14 @@ jobs:
       # 2) Approve (must be a different user than PR author)
       - name: Approve PR
         env:
-          BOT_PAT: ${{ secrets.BOT_PAT }}
-        run: |
-          set -e
-          curl -s -X POST \
-            -H "Authorization: token $BOT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
-            -d '{"event":"APPROVE","body":"Auto-approval by bot"}' >/dev/null
-          echo "✅ Approved PR #$PR_NUMBER"
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr review $PR_NUMBER --repo "${{ github.repository }}" --approve
 
       # 3) Enable auto-merge (merges after checks pass) + delete branch
       - name: Enable Auto-merge
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr merge $PR_NUMBER --auto --squash --delete-branch
+        run: gh pr merge $PR_NUMBER --repo "${{ github.repository }}" --auto --squash --delete-branch
 
       - name: Done
         run: echo "🎉 All set."
