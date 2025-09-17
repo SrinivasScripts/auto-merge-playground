@@ -19,7 +19,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install latest GitHub CLI
+      - name: Install GitHub CLI
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -30,7 +30,7 @@ jobs:
         id: ctx
         run: echo "branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-      # ---------- Create or reuse PR ----------
+      # ---------- Create (or recreate) PR as github-actions[bot] ----------
       - name: Create or reuse PR → main (author = github-actions[bot])
         id: pr
         env:
@@ -39,30 +39,38 @@ jobs:
           set -euo pipefail
           branch="${{ steps.ctx.outputs.branch }}"
 
-          # Try creating a PR; if one exists, gh pr create exits non-zero but we ignore
-          pr_json=$(gh pr create \
-            --title "[AUTO] PR from $branch to main" \
-            --body  "Auto-generated from \`$branch\` to \`main\`." \
-            --base main --head "$branch" \
-            --json number,url 2>/dev/null || true)
+          # Find existing open PR from this branch to main
+          existing=$(gh pr list --head "$branch" --base main --state open --json number,author,url --jq '.[0]' || true)
 
-          if [[ -z "$pr_json" ]]; then
-            # Find existing open PR
-            pr_json=$(gh pr list --head "$branch" --base main --state open --json number,url --jq '.[0]' || true)
+          if [[ -n "$existing" ]]; then
+            pr_number=$(echo "$existing" | jq -r .number)
+            pr_url=$(echo "$existing" | jq -r .url)
+            pr_author=$(echo "$existing" | jq -r .author.login)
+            echo "Found existing PR #$pr_number by $pr_author ($pr_url)"
+
+            # If not authored by github-actions[bot], close so we can recreate with this token
+            if [[ "$pr_author" != "github-actions[bot]" ]]; then
+              echo "Closing PR #$pr_number (author=$pr_author) to recreate as github-actions[bot]…"
+              gh pr close "$pr_number" -c "Recreating PR authored by github-actions[bot] for auto-approval."
+              existing=""
+            fi
           fi
 
-          if [[ -z "$pr_json" ]]; then
-            echo "::error::Failed to create or find a PR for branch $branch"
-            exit 1
+          if [[ -z "$existing" ]]; then
+            pr_json=$(gh pr create \
+              --title "[AUTO] PR from $branch to main" \
+              --body  "Auto-generated from \`$branch\` to \`main\`." \
+              --base main --head "$branch" \
+              --json number,url,author)
+            pr_number=$(echo "$pr_json" | jq -r .number)
+            pr_url=$(echo "$pr_json" | jq -r .url)
+            pr_author=$(echo "$pr_json" | jq -r .author.login)
+            echo "Created PR #$pr_number by $pr_author ($pr_url)"
           fi
-
-          pr_number=$(echo "$pr_json" | jq -r .number)
-          pr_url=$(echo "$pr_json" | jq -r .url)
-          echo "Found/Created PR #$pr_number ($pr_url)"
 
           echo "number=$pr_number" >> "$GITHUB_OUTPUT"
 
-      # ---------- Guard: ensure approver ≠ author ----------
+      # ---------- Guard: approver must differ from author ----------
       - name: Guard identities (approver ≠ author)
         env:
           BOT_PAT: ${{ secrets.BOT_PAT }}
@@ -70,36 +78,26 @@ jobs:
         run: |
           set -euo pipefail
           pr=${{ steps.pr.outputs.number }}
-
-          # Get PR author using GITHUB_TOKEN
           author=$(gh api repos/${{ github.repository }}/pulls/$pr --jq .user.login)
-
-          # Identify approver using BOT_PAT
           approver=$(GH_TOKEN=$BOT_PAT gh api user --jq .login)
-
           echo "PR author : $author"
           echo "Approver  : $approver"
-
           if [ "$author" = "$approver" ]; then
             echo "::error::Approver and author are the same ($author). Use a different account/token for BOT_PAT."
             exit 1
           fi
 
-      # ---------- Approve PR ----------
+      # ---------- Approve & Auto-merge ----------
       - name: Approve PR (bot review)
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: |
-          set -euo pipefail
-          gh pr review ${{ steps.pr.outputs.number }} --approve
-          echo "Approved PR #${{ steps.pr.outputs.number }}"
+        run: gh pr review ${{ steps.pr.outputs.number }} --approve
 
-      # ---------- Enable Auto-merge ----------
       - name: Enable Auto-merge
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
           set -euo pipefail
-          # Use --squash or --rebase if your main requires linear history
+          # Use --squash or --rebase if your repo enforces linear history
           gh pr merge ${{ steps.pr.outputs.number }} --auto --merge --delete-branch
           echo "Auto-merge enabled for PR #${{ steps.pr.outputs.number }}"
