@@ -1,16 +1,5 @@
-name: Auto PR + Approve + Auto-merge (simple)
-
-on:
-  push:
-    branches: [ "auto-*" ]
-
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
   auto_pr_and_merge:
-    if: startsWith(github.ref_name, 'auto-') 
     runs-on: ubuntu-latest
     steps:
       - name: Install jq
@@ -19,40 +8,60 @@ jobs:
       - name: Set branch name
         run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
 
-      # 1) Create or reuse PR (author = github-actions[bot])
-      - name: Create or reuse PR
+      - name: Create or reuse PR (skip if none)
+        id: create
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
+          API="https://api.github.com/repos/${{ github.repository }}"
           CREATE=$(curl -s -w "\n%{http_code}\n" -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls" \
+            -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API/pulls" \
             -d "{\"title\":\"[AUTO] $BRANCH_NAME → main\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Auto-generated from '$BRANCH_NAME' to main.\"}")
           BODY=$(echo "$CREATE" | sed '$d'); CODE=$(echo "$CREATE" | tail -n1)
+
           if [ "$CODE" = "201" ]; then
-            PR_NUMBER=$(echo "$BODY" | jq -r .number)
-          else
-            PR_NUMBER=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
-              | jq -r '.[0].number')
-            [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ] && { echo "::error::Could not create/find PR (HTTP $CODE)"; exit 1; }
+            echo "pr=$(echo "$BODY" | jq -r .number)" >> "$GITHUB_OUTPUT"
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Created PR"
+            exit 0
           fi
-          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
-          echo "✅ PR #$PR_NUMBER ready"
 
-      # 2) Approve (must be a different user than PR author)
+          PR_NUMBER=$(curl -s -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
+            | jq -r '.[0].number')
+
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            echo "pr=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+            echo "🔁 Reusing PR #$PR_NUMBER"
+            exit 0
+          fi
+
+          STATUS=$(curl -s -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API/compare/main...$BRANCH_NAME" | jq -r .status)
+          if [ "$STATUS" = "identical" ] || [ "$STATUS" = "behind" ]; then
+            echo "ℹ️ No new commits ahead of main; skipping PR."
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::PR creation failed (HTTP $CODE), skipping."
+          echo "has_pr=false" >> "$GITHUB_OUTPUT"
+          exit 0
+
       - name: Approve PR
+        if: steps.create.outputs.has_pr == 'true'
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr review $PR_NUMBER --repo "${{ github.repository }}" --approve
+        run: gh pr review ${{ steps.create.outputs.pr }} --repo "${{ github.repository }}" --approve
 
-      # 3) Enable auto-merge (merges after checks pass) + delete branch
       - name: Enable Auto-merge
+        if: steps.create.outputs.has_pr == 'true'
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr merge $PR_NUMBER --repo "${{ github.repository }}" --auto --squash --delete-branch
+        run: gh pr merge ${{ steps.create.outputs.pr }} --repo "${{ github.repository }}" --auto --squash --delete-branch
 
       - name: Done
-        run: echo "🎉 All set."
+        run: echo "🎉 Workflow finished successfully."
