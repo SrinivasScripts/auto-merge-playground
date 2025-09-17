@@ -1,105 +1,122 @@
-name: Auto PR + Auto-approve + Auto-merge (auto-* branches)
+name: Auto PR + Approve + Enable Auto-merge
 
 on:
-  # 1) When an auto-* branch is pushed, create/reuse a PR -> main
   push:
     branches: [ "auto-*" ]
-  # 2) When a PR to main exists/updates, approve + enable auto-merge
-  pull_request:
-    branches: [ main ]
-    types: [ opened, synchronize, reopened, ready_for_review ]
 
 permissions:
   contents: write
   pull-requests: write
-  checks: read
 
 jobs:
-  # ------------------------
-  # Create PR on push
-  # ------------------------
-  create_pr:
-    if: github.event_name == 'push'
+  auto_pr_and_merge:
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure jq is available
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Create or reuse PR (author = github-actions[bot])
+      - name: Set branch name
+        run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
+
+      # 1) Create or reuse PR (author = github-actions[bot])
+      - name: Create or reuse PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
-
-          # Try to create the PR
-          RESP=$(curl -s -w "\n%{http_code}\n" -X POST \
+          CREATE=$(curl -s -w "\n%{http_code}\n" -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/pulls" \
             -d "{\"title\":\"[AUTO] $BRANCH_NAME → main\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Auto-generated from '$BRANCH_NAME' to main.\"}")
 
-          BODY=$(echo "$RESP" | sed '$d'); CODE=$(echo "$RESP" | tail -n1)
-
+          BODY=$(echo "$CREATE" | sed '$d'); CODE=$(echo "$CREATE" | tail -n1)
           if [ "$CODE" = "201" ]; then
-            echo "Created PR #$(echo "$BODY" | jq -r .number)"
-            exit 0
+            PR_NUMBER=$(echo "$BODY" | jq -r .number)
+          else
+            # Reuse existing open PR for this branch
+            PR_NUMBER=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
+              | jq -r '.[0].number')
+            [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ] && { echo "::error::Failed to create/find PR. HTTP $CODE: $BODY"; exit 1; }
           fi
+          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
+          echo "✅ PR #$PR_NUMBER ready"
 
-          # If already exists, reuse it
-          PR_NUMBER=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
-            | jq -r '.[0].number')
-
-          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
-            echo "Reused existing PR #$PR_NUMBER"
-            exit 0
-          fi
-
-          echo "::error::Failed to create/reuse PR (HTTP $CODE): $BODY"
-          exit 1
-
-  # ------------------------
-  # Approve + enable auto-merge on PRs to main
-  # ------------------------
-  auto_merge:
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'auto-') && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Verify GitHub CLI
-        run: gh --version
-
-      - name: Capture context
-        id: ctx
-        run: |
-          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-          echo "PR_AUTHOR=${{ github.event.pull_request.user.login }}" >> "$GITHUB_OUTPUT"
-
-      # Make sure approver != author
-      - name: Guard identities (approver ≠ author)
+      # 2) Get PR author & GraphQL node_id
+      - name: Fetch PR details
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          APPROVER=$(gh api user --jq .login)
-          echo "PR author : ${{ steps.ctx.outputs.PR_AUTHOR }}"
-          echo "Approver  : $APPROVER"
-          if [ "$APPROVER" = "${{ steps.ctx.outputs.PR_AUTHOR }}" ]; then
-            echo "::error::Approver and author are the same. Use GITHUB_TOKEN for PR creation or a different BOT_PAT user."
+          PR_JSON=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER")
+          AUTHOR=$(echo "$PR_JSON" | jq -r .user.login)
+          PR_NODE_ID=$(echo "$PR_JSON" | jq -r .node_id)
+          echo "PR_AUTHOR=$AUTHOR"   >> $GITHUB_ENV
+          echo "PR_NODE_ID=$PR_NODE_ID" >> $GITHUB_ENV
+          echo "PR author : $AUTHOR"
+
+      # 3) Guard: approver must differ from author
+      - name: Guard identities (approver ≠ author)
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+        run: |
+          set -euo pipefail
+          APPROVER=$(curl -s -H "Authorization: token $BOT_PAT" https://api.github.com/user | jq -r .login)
+          echo "Approver : $APPROVER"
+          if [ "$APPROVER" = "${PR_AUTHOR}" ]; then
+            echo "::error::Approver and author are the same ($APPROVER). Create PR with GITHUB_TOKEN or use a different BOT_PAT user."
             exit 1
           fi
 
+      # 4) Approve (satisfy the "1 review required")
       - name: Approve PR
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr review ${{ steps.ctx.outputs.PR_NUMBER }} --approve
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+        run: |
+          set -euo pipefail
+          RESP=$(curl -s -w "\n%{http_code}\n" -X POST \
+            -H "Authorization: token $BOT_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
+            -d '{"event":"APPROVE","body":"Auto-approval by bot"}')
+          BODY=$(echo "$RESP" | sed '$d'); CODE=$(echo "$RESP" | tail -n1)
+          if [ "$CODE" -lt 200 ] || [ "$CODE" -gt 299 ]; then
+            echo "$BODY"
+            echo "::error::Approval failed (HTTP $CODE). Does BOT_PAT have pull_requests:write and repo write access? Is approver different from author?"
+            exit 1
+          fi
+          echo "✅ Approved PR #$PR_NUMBER"
 
-      # Enable auto-merge; GitHub merges when all required checks pass
-      - name: Enable Auto-merge (delete branch after merge)
+      # 5) Enable auto-merge via GraphQL (merges when all required checks pass)
+      - name: Enable Auto-merge (MERGE)
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr merge ${{ steps.ctx.outputs.PR_NUMBER }} --auto --merge --delete-branch
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+        run: |
+          set -euo pipefail
+          read -r -d '' QUERY << 'EOF'
+          mutation($prid:ID!, $method:PullRequestMergeMethod!) {
+            enablePullRequestAutoMerge(input:{pullRequestId:$prid, mergeMethod:$method}) {
+              pullRequest { number, autoMergeRequest { enabledAt, mergeMethod } }
+            }
+          }
+          EOF
+          VARS=$(jq -n --arg prid "$PR_NODE_ID" --arg method "MERGE" '{prid:$prid, method:$method}')
+          RESP=$(curl -s -X POST https://api.github.com/graphql \
+            -H "Authorization: bearer $BOT_PAT" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg q "$QUERY" --argjson v "$VARS" '{query:$q, variables:$v}')")
 
-      - name: Done
-        run: echo "✅ Auto-merge enabled for PR #${{ steps.ctx.outputs.PR_NUMBER }}"
+          # Check for GraphQL errors
+          ERR=$(echo "$RESP" | jq '.errors')
+          if [ "$ERR" != "null" ]; then
+            echo "$RESP"
+            echo "::error::Failed to enable auto-merge (GraphQL)."
+            exit 1
+          fi
+          echo "✅ Auto-merge enabled for PR #$PR_NUMBER (MERGE). It will merge when checks pass."
+
+      - name: Finish
+        run: echo "Done."
