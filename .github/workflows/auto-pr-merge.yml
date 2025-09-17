@@ -58,6 +58,11 @@ jobs:
 
           echo "ℹ️ No new PR needed."
           echo "has_pr=false" >> "$GITHUB_OUTPUT"
+      - name: Approve PR
+        if: steps.create_pr.outputs.has_pr == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr review ${{ steps.create_pr.outputs.pr }} --repo "${{ github.repository }}" --approve
 
       # Auto-merge only if a PR exists
       - name: Auto-merge PR
