@@ -63,5 +63,5 @@ jobs:
       - name: Auto-merge PR
         if: steps.create_pr.outputs.has_pr == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: gh pr merge ${{ steps.create_pr.outputs.pr }} --repo "${{ github.repository }}" --auto --merge --delete-branch
