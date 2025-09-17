@@ -22,48 +22,47 @@ jobs:
         id: ctx
         run: echo "branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure gh is available
-        run: gh --version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Find or create PR → main
+      - name: Create or reuse PR -> main (author = github-actions[bot])
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           branch="${{ steps.ctx.outputs.branch }}"
-
-          # Reuse existing open PR if present
-          existing=$(gh pr list --head "$branch" --base main --state open --json number,url -q '.[0]')
-          if [[ -n "$existing" ]]; then
-            pr_number=$(echo "$existing" | jq -r .number)
-            pr_url=$(echo "$existing" | jq -r .url)
-            echo "Reusing PR #$pr_number ($pr_url)"
+          found=$(gh pr list --head "$branch" --base main --state open --json number,url -q '.[0]')
+          if [[ -n "$found" ]]; then
+            pr=$(echo "$found" | jq -r .number)
+            url=$(echo "$found" | jq -r .url)
+            echo "Reusing PR #$pr ($url)"
           else
-            pr_json=$(gh pr create \
+            j=$(gh pr create \
               --title "[AUTO] PR from $branch to main" \
-              --body  "This PR is auto-generated from \`$branch\` to \`main\`." \
+              --body  "Auto-generated from \`$branch\` to \`main\`." \
               --base main --head "$branch" \
               --json number,url)
-            pr_number=$(echo "$pr_json" | jq -r .number)
-            pr_url=$(echo "$pr_json" | jq -r .url)
-            echo "Created PR #$pr_number ($pr_url)"
+            pr=$(echo "$j" | jq -r .number)
+            url=$(echo "$j" | jq -r .url)
+            echo "Created PR #$pr ($url)"
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure BOT_PAT exists (fail if missing)
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+        run: |
+          if [ -z "$BOT_PAT" ]; then
+            echo "::error::Missing BOT_PAT secret. Create a PAT with Pull requests: R/W and Contents: R/W, then add it as repo secret BOT_PAT."
+            exit 1
           fi
 
-          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
-
-      # --- These two steps are only needed if main requires reviews ---
       - name: Approve PR (bot review)
-        if: ${{ secrets.BOT_PAT != '' }}
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: gh pr review ${{ steps.pr.outputs.number }} --approve
 
-      - name: Enable Auto-merge (merges when checks pass)
-        if: ${{ secrets.BOT_PAT != '' }}
+      - name: Enable Auto-merge (merges when requirements satisfied)
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
-        run: gh pr merge ${{ steps.pr.outputs.number }} --auto --merge --delete-branch
-        # use --squash or --rebase if your main requires linear history
+        run: |
+          # If your repo requires linear history, change to --squash or --rebase
+          gh pr merge ${{ steps.pr.outputs.number }} --auto --merge --delete-branch
