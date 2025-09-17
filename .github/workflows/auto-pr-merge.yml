@@ -9,93 +9,85 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  MERGE_METHOD: merge   # or: squash | rebase
+
 jobs:
-  build:
+  auto-pr-merge:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Set branch name
-        run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
-
-      # Create (or reuse) the PR with GITHUB_TOKEN so the author is github-actions[bot]
-      - name: Create or reuse PR
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Ensure modern gh so --json/--auto works
+      - name: Install latest GitHub CLI
         run: |
-          set -e
-          CREATE=$(curl -s -w "\n%{http_code}\n" -X POST \
-            -H "Authorization: token $TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls" \
-            -d "{\"title\":\"[AUTO] $BRANCH_NAME → main\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Auto-generated from '$BRANCH_NAME' to main.\"}")
-          BODY=$(echo "$CREATE" | sed '$d'); CODE=$(echo "$CREATE" | tail -n1)
-          if [ "$CODE" = "201" ]; then
-            PR_NUMBER=$(echo "$BODY" | jq -r .number)
+          set -euo pipefail
+          sudo apt-get remove -y gh || true
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+            sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
+            sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh jq
+          gh --version
+
+      - name: Derive branch name
+        id: ctx
+        run: echo "branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+      # Create or reuse PR (author = github-actions[bot])
+      - name: Create or reuse PR → main
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${{ steps.ctx.outputs.branch }}"
+          existing=$(gh pr list --head "$branch" --base main --state open --json number,url,author --jq '.[0]' || true)
+          if [[ -n "$existing" ]]; then
+            echo "$existing" | jq .
+            echo "number=$(echo "$existing" | jq -r .number)" >> "$GITHUB_OUTPUT"
           else
-            # Reuse existing open PR
-            PR_NUMBER=$(curl -s -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
-              | jq -r '.[0].number')
-            [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ] && { echo "::error::Could not create/find PR (HTTP $CODE)"; exit 1; }
+            created=$(gh pr create \
+              --title "[AUTO] PR from $branch to main" \
+              --body  "Auto-generated from \`$branch\` to \`main\`." \
+              --base main --head "$branch" \
+              --json number,url,author)
+            echo "$created" | jq .
+            echo "number=$(echo "$created" | jq -r .number)" >> "$GITHUB_OUTPUT"
           fi
-          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
-          echo "Created/Reused PR #$PR_NUMBER"
 
-      # Approve with BOT_PAT (must be a DIFFERENT user than the PR author)
-      - name: Approve PR
+      # Guard: approver must differ from author
+      - name: Guard identities (approver ≠ author)
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BOT_PAT: ${{ secrets.BOT_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          # sanity: ensure approver != author
-          AUTHOR=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-                   "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER" | jq -r .user.login)
-          APPROVER=$(curl -s -H "Authorization: token $BOT_PAT" -H "Accept: application/vnd.github+json" \
-                    https://api.github.com/user | jq -r .login)
-          if [ "$AUTHOR" = "$APPROVER" ]; then
-            echo "::error::Approver ($APPROVER) cannot approve their own PR ($AUTHOR). Keep PR creation with GITHUB_TOKEN or use a different PAT user."
+          set -euo pipefail
+          pr=${{ steps.pr.outputs.number }}
+          author=$(gh api repos/${{ github.repository }}/pulls/$pr --jq .user.login)
+          approver=$(GH_TOKEN=$BOT_PAT gh api user --jq .login)
+          echo "PR author : $author"
+          echo "Approver  : $approver"
+          if [ "$author" = "$approver" ]; then
+            echo "::error::Approver and author are the same ($author). Use a different account/token for BOT_PAT."
             exit 1
           fi
 
-          curl -s -X POST \
-            -H "Authorization: token $BOT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
-            -d '{"event":"APPROVE","body":"Auto-approval by bot"}' \
-            >/dev/null
-          echo "Approved PR #$PR_NUMBER as $APPROVER"
+      # Approve to satisfy review requirement
+      - name: Approve PR
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr review ${{ steps.pr.outputs.number }} --approve
 
-      # Merge (change merge_method if your repo enforces linear history)
-      - name: Merge PR
+      # Enable auto-merge -> GitHub will MERGE ONLY AFTER required checks pass
+      - name: Enable Auto-merge (waits for checks)
         env:
-          BOT_PAT: ${{ secrets.BOT_PAT }}
-        run: |
-          set -e
-          RESP=$(curl -s -w "\n%{http_code}\n" -X PUT \
-            -H "Authorization: token $BOT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER/merge" \
-            -d '{"commit_title":"Auto-merged PR","merge_method":"merge"}')
-          BODY=$(echo "$RESP" | sed '$d'); CODE=$(echo "$RESP" | tail -n1)
-          [ "$CODE" = "200" ] || { echo "$BODY"; echo "::error::Merge failed (HTTP $CODE). If linear history is required, use merge_method=squash or rebase. If checks are required, they must pass first."; exit 1; }
-          echo "Merged PR #$PR_NUMBER"
-        # ---- Delete source branch ----
-      - name: Delete branch after merge
-        env:
-          BOT_PAT: ${{ secrets.BOT_PAT }}
-        run: |
-          set -e
-          BRANCH_NAME="${{ env.BRANCH_NAME }}"
-          echo "Deleting branch refs/heads/$BRANCH_NAME"
-          curl -s -X DELETE \
-            -H "Authorization: token $BOT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME" \
-            || echo "::warning::Could not delete branch $BRANCH_NAME"
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr merge ${{ steps.pr.outputs.number }} --auto --${{ env.MERGE_METHOD }} --delete-branch
+
+      - name: Done
+        run: echo "✅ PR is set to auto-merge once checks are green."
