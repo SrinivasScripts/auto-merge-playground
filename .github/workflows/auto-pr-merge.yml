@@ -1,0 +1,69 @@
+name: Pull-Request Auto-Deploy
+
+on:
+  push:
+    branches:
+      - "auto-*"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-pr-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive branch name
+        id: ctx
+        run: echo "branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure gh is available
+        run: gh --version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find or create PR → main
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${{ steps.ctx.outputs.branch }}"
+
+          # Reuse existing open PR if present
+          existing=$(gh pr list --head "$branch" --base main --state open --json number,url -q '.[0]')
+          if [[ -n "$existing" ]]; then
+            pr_number=$(echo "$existing" | jq -r .number)
+            pr_url=$(echo "$existing" | jq -r .url)
+            echo "Reusing PR #$pr_number ($pr_url)"
+          else
+            pr_json=$(gh pr create \
+              --title "[AUTO] PR from $branch to main" \
+              --body  "This PR is auto-generated from \`$branch\` to \`main\`." \
+              --base main --head "$branch" \
+              --json number,url)
+            pr_number=$(echo "$pr_json" | jq -r .number)
+            pr_url=$(echo "$pr_json" | jq -r .url)
+            echo "Created PR #$pr_number ($pr_url)"
+          fi
+
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      # --- These two steps are only needed if main requires reviews ---
+      - name: Approve PR (bot review)
+        if: ${{ secrets.BOT_PAT != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr review ${{ steps.pr.outputs.number }} --approve
+
+      - name: Enable Auto-merge (merges when checks pass)
+        if: ${{ secrets.BOT_PAT != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr merge ${{ steps.pr.outputs.number }} --auto --merge --delete-branch
+        # use --squash or --rebase if your main requires linear history
