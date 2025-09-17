@@ -1,58 +1,64 @@
-name: Auto PR and Merge
+name: Auto PR + Approve + Auto-merge (simple)
 
 on:
   push:
-    branches:
-      - "auto-*"
+    branches: [ "auto-*" ]
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  create_and_merge:
+  auto_pr_and_merge:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Create Pull Request
-        uses: actions/github-script@v7
-        env:
-          GITHUB_TOKEN: ${{ secrets.BOT_PAT }}
-        with:
-          script: |
-            const { repo, owner } = context.repo;
-            const base = "main";
-            const head = process.env.GITHUB_REF.replace("refs/heads/", "");
-            const prs = await github.rest.pulls.list({ owner, repo, head: `${owner}:${head}`, base });
-            if (prs.data.length === 0) {
-              const pr = await github.rest.pulls.create({
-                owner,
-                repo,
-                head,
-                base,
-                title: `Auto PR from ${head} to ${base}`,
-                body: 'Automated PR',
-              });
-              core.setOutput('pr_number', pr.data.number);
-            } else {
-              core.setOutput('pr_number', prs.data[0].number);
-            }
+      - name: Set branch name
+        run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
 
-      - name: Approve PR
-        uses: actions/github-script@v7
+      # 1) Create or reuse PR (author = github-actions[bot])
+      - name: Create or reuse PR
         env:
-          GITHUB_TOKEN: ${{ secrets.BOT_PAT }}
-        with:
-          github-token: ${{ secrets.BOT_PAT }}
-          script: |
-            const pr_number = core.getInput('pr_number');
-            await github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr_number,
-              event: 'APPROVE'
-            });
-
-      - name: Merge PR
-        env:
-          GITHUB_TOKEN: ${{ secrets.BOT_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_NUMBER=$(echo ${{ steps.create_pr.outputs.pr_number }})
-          gh pr merge $PR_NUMBER --merge --admin --repo $GITHUB_REPOSITORY
+          set -e
+          CREATE=$(curl -s -w "\n%{http_code}\n" -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls" \
+            -d "{\"title\":\"[AUTO] $BRANCH_NAME → main\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Auto-generated from '$BRANCH_NAME' to main.\"}")
+          BODY=$(echo "$CREATE" | sed '$d'); CODE=$(echo "$CREATE" | tail -n1)
+          if [ "$CODE" = "201" ]; then
+            PR_NUMBER=$(echo "$BODY" | jq -r .number)
+          else
+            PR_NUMBER=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
+              | jq -r '.[0].number')
+            [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ] && { echo "::error::Could not create/find PR (HTTP $CODE)"; exit 1; }
+          fi
+          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
+          echo "✅ PR #$PR_NUMBER ready"
+
+      # 2) Approve (must be a different user than PR author)
+      - name: Approve PR
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
+        run: |
+          set -e
+          curl -s -X POST \
+            -H "Authorization: token $BOT_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
+            -d '{"event":"APPROVE","body":"Auto-approval by bot"}' >/dev/null
+          echo "✅ Approved PR #$PR_NUMBER"
+
+      # 3) Enable auto-merge (merges after checks pass) + delete branch
+      - name: Enable Auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr merge $PR_NUMBER --auto --squash --delete-branch
+
+      - name: Done
+        run: echo "🎉 All set."
