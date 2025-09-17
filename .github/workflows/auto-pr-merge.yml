@@ -1,60 +1,105 @@
-name: Pull-Request Auto-Deploy
+name: Auto PR + Auto-approve + Auto-merge (auto-* branches)
 
 on:
+  # 1) When an auto-* branch is pushed, create/reuse a PR -> main
   push:
-    branches:
-      - 'auto-*'
+    branches: [ "auto-*" ]
+  # 2) When a PR to main exists/updates, approve + enable auto-merge
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
 
 jobs:
-  build:
+  # ------------------------
+  # Create PR on push
+  # ------------------------
+  create_pr:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 
-      - name: Set Branch Name
-        run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
-      - name: Print Current Branch
-        run: "echo Current branch name: $BRANCH_NAME"
-      - name: Configure Git
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions@github.com"
-      - name: Fetch target branch (main)
-        run: git fetch origin main:main
-      - name: Create Pull Request via GitHub API
+      - name: Ensure jq is available
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Create or reuse PR (author = github-actions[bot])
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_RESPONSE=$(curl -s -X POST \
+          set -euo pipefail
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+
+          # Try to create the PR
+          RESP=$(curl -s -w "\n%{http_code}\n" -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/pulls \
-            -d '{
-              "title": "[AUTO] PR from '${BRANCH_NAME}' to main",
-              "head": "'${BRANCH_NAME}'",
-              "base": "main",
-              "body": "This PR is auto-generated from '${BRANCH_NAME}' to main."
-            }')
-          echo "$PR_RESPONSE"
-          PR_NUMBER=$(echo "$PR_RESPONSE" | jq .number)
-          if [ "$PR_NUMBER" == "null" ]; then
-            echo "Error creating PR"
-            exit 1
-          else
-            echo "PR created successfully: #$PR_NUMBER"
-            echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls" \
+            -d "{\"title\":\"[AUTO] $BRANCH_NAME → main\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Auto-generated from '$BRANCH_NAME' to main.\"}")
+
+          BODY=$(echo "$RESP" | sed '$d'); CODE=$(echo "$RESP" | tail -n1)
+
+          if [ "$CODE" = "201" ]; then
+            echo "Created PR #$(echo "$BODY" | jq -r .number)"
+            exit 0
           fi
-      - name: Auto-Merge Pull Request
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # If already exists, reuse it
+          PR_NUMBER=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
+            | jq -r '.[0].number')
+
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            echo "Reused existing PR #$PR_NUMBER"
+            exit 0
+          fi
+
+          echo "::error::Failed to create/reuse PR (HTTP $CODE): $BODY"
+          exit 1
+
+  # ------------------------
+  # Approve + enable auto-merge on PRs to main
+  # ------------------------
+  auto_merge:
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'auto-') && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify GitHub CLI
+        run: gh --version
+
+      - name: Capture context
+        id: ctx
         run: |
-          curl -s -X PUT \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/merge \
-            -d '{
-              "commit_title": "Auto-merged PR",
-              "merge_method": "merge"
-            }'
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "PR_AUTHOR=${{ github.event.pull_request.user.login }}" >> "$GITHUB_OUTPUT"
+
+      # Make sure approver != author
+      - name: Guard identities (approver ≠ author)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          set -euo pipefail
+          APPROVER=$(gh api user --jq .login)
+          echo "PR author : ${{ steps.ctx.outputs.PR_AUTHOR }}"
+          echo "Approver  : $APPROVER"
+          if [ "$APPROVER" = "${{ steps.ctx.outputs.PR_AUTHOR }}" ]; then
+            echo "::error::Approver and author are the same. Use GITHUB_TOKEN for PR creation or a different BOT_PAT user."
+            exit 1
+          fi
+
+      - name: Approve PR
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr review ${{ steps.ctx.outputs.PR_NUMBER }} --approve
+
+      # Enable auto-merge; GitHub merges when all required checks pass
+      - name: Enable Auto-merge (delete branch after merge)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: gh pr merge ${{ steps.ctx.outputs.PR_NUMBER }} --auto --merge --delete-branch
+
+      - name: Done
+        run: echo "✅ Auto-merge enabled for PR #${{ steps.ctx.outputs.PR_NUMBER }}"
