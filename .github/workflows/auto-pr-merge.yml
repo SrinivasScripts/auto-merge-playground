@@ -3,83 +3,58 @@ name: Pull-Request Auto-Deploy
 on:
   push:
     branches:
-      - "auto-*"
-
-permissions:
-  contents: write
-  pull-requests: write
+      - 'auto-*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Set branch name
+          fetch-depth: 0 
+      - name: Set Branch Name
         run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
-
-      # Create (or reuse) the PR with GITHUB_TOKEN so the author is github-actions[bot]
-      - name: Create or reuse PR
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Print Current Branch
+        run: "echo Current branch name: $BRANCH_NAME"
+      - name: Configure Git
         run: |
-          set -e
-          CREATE=$(curl -s -w "\n%{http_code}\n" -X POST \
-            -H "Authorization: token $TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls" \
-            -d "{\"title\":\"[AUTO] $BRANCH_NAME → main\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Auto-generated from '$BRANCH_NAME' to main.\"}")
-          BODY=$(echo "$CREATE" | sed '$d'); CODE=$(echo "$CREATE" | tail -n1)
-          if [ "$CODE" = "201" ]; then
-            PR_NUMBER=$(echo "$BODY" | jq -r .number)
-          else
-            # Reuse existing open PR
-            PR_NUMBER=$(curl -s -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:$BRANCH_NAME&base=main" \
-              | jq -r '.[0].number')
-            [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ] && { echo "::error::Could not create/find PR (HTTP $CODE)"; exit 1; }
-          fi
-          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
-          echo "Created/Reused PR #$PR_NUMBER"
-      # Approve with BOT_PAT (must be a DIFFERENT user than the PR author)
-      - name: Approve PR
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions@github.com"
+      - name: Fetch target branch (main)
+        run: git fetch origin main:main
+      - name: Create Pull Request via GitHub API
         env:
-          BOT_PAT: ${{ secrets.BOT_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          # sanity: ensure approver != author
-          AUTHOR=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-                   "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER" | jq -r .user.login)
-          APPROVER=$(curl -s -H "Authorization: token $BOT_PAT" -H "Accept: application/vnd.github+json" \
-                    https://api.github.com/user | jq -r .login)
-          if [ "$AUTHOR" = "$APPROVER" ]; then
-            echo "::error::Approver ($APPROVER) cannot approve their own PR ($AUTHOR). Keep PR creation with GITHUB_TOKEN or use a different PAT user."
+          PR_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/pulls \
+            -d '{
+              "title": "[AUTO] PR from '${BRANCH_NAME}' to main",
+              "head": "'${BRANCH_NAME}'",
+              "base": "main",
+              "body": "This PR is auto-generated from '${BRANCH_NAME}' to main."
+            }')
+          echo "$PR_RESPONSE"
+          PR_NUMBER=$(echo "$PR_RESPONSE" | jq .number)
+          if [ "$PR_NUMBER" == "null" ]; then
+            echo "Error creating PR"
             exit 1
+          else
+            echo "PR created successfully: #$PR_NUMBER"
+            echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
           fi
-          curl -s -X POST \
-            -H "Authorization: token $BOT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
-            -d '{"event":"APPROVE","body":"Auto-approval by bot"}' \
-            >/dev/null
-          echo "Approved PR #$PR_NUMBER as $APPROVER"
-      # Merge (change merge_method if your repo enforces linear history)
-      - name: Merge PR
+      - name: Auto-Merge Pull Request
         env:
-          BOT_PAT: ${{ secrets.BOT_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          RESP=$(curl -s -w "\n%{http_code}\n" -X PUT \
-            -H "Authorization: token $BOT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER/merge" \
-            -d '{"commit_title":"Auto-merged PR","merge_method":"merge"}')
-          BODY=$(echo "$RESP" | sed '$d'); CODE=$(echo "$RESP" | tail -n1)
-          [ "$CODE" = "200" ] || { echo "$BODY"; echo "::error::Merge failed (HTTP $CODE). If linear history is required, use merge_method=squash or rebase. If checks are required, they must pass first."; exit 1; }
-          echo "Merged PR #$PR_NUMBER"
+          curl -s -X PUT \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/merge \
+            -d '{
+              "commit_title": "Auto-merged PR",
+              "merge_method": "merge"
+            }'
